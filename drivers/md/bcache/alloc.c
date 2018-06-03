@@ -287,8 +287,11 @@ do {									\
 			break;						\
 									\
 		mutex_unlock(&(ca)->set->bucket_lock);			\
-		if (kthread_should_stop())				\
-			return 0;					\
+		if (kthread_should_stop() ||				\
+		    test_bit(CACHE_SET_IO_DISABLE, &ca->set->flags)) {	\
+			set_current_state(TASK_RUNNING);		\
+			goto out;					\
+		}							\
 									\
 		schedule();						\
 		mutex_lock(&(ca)->set->bucket_lock);			\
@@ -375,6 +378,9 @@ retry_invalidate:
 			bch_prio_write(ca);
 		}
 	}
+out:
+	wait_for_kthread_stop();
+	return 0;
 }
 
 /* Allocation */

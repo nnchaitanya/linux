@@ -262,12 +262,12 @@ static __poll_t rpmsg_eptdev_poll(struct file *filp, poll_table *wait)
 	__poll_t mask = 0;
 
 	if (!eptdev->ept)
-		return POLLERR;
+		return EPOLLERR;
 
 	poll_wait(filp, &eptdev->readq, wait);
 
 	if (!skb_queue_empty(&eptdev->queue))
-		mask |= POLLIN | POLLRDNORM;
+		mask |= EPOLLIN | EPOLLRDNORM;
 
 	mask |= rpmsg_poll(eptdev->ept, filp, wait);
 
@@ -581,4 +581,6 @@ static void rpmsg_chrdev_exit(void)
 	unregister_chrdev_region(rpmsg_major, RPMSG_DEV_MAX);
 }
 module_exit(rpmsg_chrdev_exit);
+
+MODULE_ALIAS("rpmsg:rpmsg_chrdev");
 MODULE_LICENSE("GPL v2");

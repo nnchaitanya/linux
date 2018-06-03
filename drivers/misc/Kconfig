@@ -75,7 +75,6 @@ config ATMEL_TCB_CLKSRC
 config ATMEL_TCB_CLKSRC_BLOCK
 	int
 	depends on ATMEL_TCB_CLKSRC
-	prompt "TC Block" if CPU_AT32AP700X
 	default 0
 	range 0 1
 	help
@@ -512,5 +511,6 @@ source "drivers/misc/mic/Kconfig"
 source "drivers/misc/genwqe/Kconfig"
 source "drivers/misc/echo/Kconfig"
 source "drivers/misc/cxl/Kconfig"
+source "drivers/misc/ocxl/Kconfig"
 source "drivers/misc/cardreader/Kconfig"
 endmenu

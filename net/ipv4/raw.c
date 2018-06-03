@@ -711,9 +711,7 @@ static void raw_close(struct sock *sk, long timeout)
 	/*
 	 * Raw sockets may have direct kernel references. Kill them.
 	 */
-	rtnl_lock();
 	ip_ra_control(sk, 0, NULL);
-	rtnl_unlock();
 
 	sk_common_release(sk);
 }
@@ -990,6 +988,8 @@ struct proto raw_prot = {
 	.hash		   = raw_hash_sk,
 	.unhash		   = raw_unhash_sk,
 	.obj_size	   = sizeof(struct raw_sock),
+	.useroffset	   = offsetof(struct raw_sock, filter),
+	.usersize	   = sizeof_field(struct raw_sock, filter),
 	.h.raw_hash	   = &raw_v4_hashinfo,
 #ifdef CONFIG_COMPAT
 	.compat_setsockopt = compat_raw_setsockopt,
@@ -1140,7 +1140,7 @@ static const struct file_operations raw_seq_fops = {
 
 static __net_init int raw_init_net(struct net *net)
 {
-	if (!proc_create("raw", S_IRUGO, net->proc_net, &raw_seq_fops))
+	if (!proc_create("raw", 0444, net->proc_net, &raw_seq_fops))
 		return -ENOMEM;
 
 	return 0;

@@ -533,7 +533,7 @@ static inline int kvm_vcpu_get_idx(struct kvm_vcpu *vcpu)
 int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id);
 void kvm_vcpu_uninit(struct kvm_vcpu *vcpu);
 
-int __must_check vcpu_load(struct kvm_vcpu *vcpu);
+void vcpu_load(struct kvm_vcpu *vcpu);
 void vcpu_put(struct kvm_vcpu *vcpu);
 
 #ifdef __KVM_HAVE_IOAPIC
@@ -1045,13 +1045,7 @@ static inline int mmu_notifier_retry(struct kvm *kvm, unsigned long mmu_seq)
 
 #ifdef CONFIG_HAVE_KVM_IRQ_ROUTING
 
-#ifdef CONFIG_S390
-#define KVM_MAX_IRQ_ROUTES 4096 //FIXME: we can have more than that...
-#elif defined(CONFIG_ARM64)
-#define KVM_MAX_IRQ_ROUTES 4096
-#else
-#define KVM_MAX_IRQ_ROUTES 1024
-#endif
+#define KVM_MAX_IRQ_ROUTES 4096 /* might need extension/rework in the future */
 
 bool kvm_arch_can_set_irq_routing(struct kvm *kvm);
 int kvm_set_irq_routing(struct kvm *kvm,
@@ -1105,7 +1099,6 @@ static inline void kvm_irq_routing_update(struct kvm *kvm)
 {
 }
 #endif
-void kvm_arch_irq_routing_update(struct kvm *kvm);
 
 static inline int kvm_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 {
@@ -1113,6 +1106,8 @@ static inline int kvm_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 }
 
 #endif /* CONFIG_HAVE_KVM_EVENTFD */
+
+void kvm_arch_irq_routing_update(struct kvm *kvm);
 
 static inline void kvm_make_request(int req, struct kvm_vcpu *vcpu)
 {
@@ -1259,5 +1254,20 @@ static inline bool vcpu_valid_wakeup(struct kvm_vcpu *vcpu)
 	return true;
 }
 #endif /* CONFIG_HAVE_KVM_INVALID_WAKEUPS */
+
+#ifdef CONFIG_HAVE_KVM_VCPU_ASYNC_IOCTL
+long kvm_arch_vcpu_async_ioctl(struct file *filp,
+			       unsigned int ioctl, unsigned long arg);
+#else
+static inline long kvm_arch_vcpu_async_ioctl(struct file *filp,
+					     unsigned int ioctl,
+					     unsigned long arg)
+{
+	return -ENOIOCTLCMD;
+}
+#endif /* CONFIG_HAVE_KVM_VCPU_ASYNC_IOCTL */
+
+void kvm_arch_mmu_notifier_invalidate_range(struct kvm *kvm,
+		unsigned long start, unsigned long end);
 
 #endif

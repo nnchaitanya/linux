@@ -592,7 +592,7 @@ static int snd_timer_stop1(struct snd_timer_instance *timeri, bool stop)
 	else
 		timeri->flags |= SNDRV_TIMER_IFLG_PAUSED;
 	snd_timer_notify1(timeri, stop ? SNDRV_TIMER_EVENT_STOP :
-			  SNDRV_TIMER_EVENT_CONTINUE);
+			  SNDRV_TIMER_EVENT_PAUSE);
  unlock:
 	spin_unlock_irqrestore(&timer->lock, flags);
 	return result;
@@ -614,7 +614,7 @@ static int snd_timer_stop_slave(struct snd_timer_instance *timeri, bool stop)
 		list_del_init(&timeri->ack_list);
 		list_del_init(&timeri->active_list);
 		snd_timer_notify1(timeri, stop ? SNDRV_TIMER_EVENT_STOP :
-				  SNDRV_TIMER_EVENT_CONTINUE);
+				  SNDRV_TIMER_EVENT_PAUSE);
 		spin_unlock(&timeri->timer->lock);
 	}
 	spin_unlock_irqrestore(&slave_active_lock, flags);
@@ -2084,9 +2084,9 @@ static __poll_t snd_timer_user_poll(struct file *file, poll_table * wait)
 	mask = 0;
 	spin_lock_irq(&tu->qlock);
 	if (tu->qused)
-		mask |= POLLIN | POLLRDNORM;
+		mask |= EPOLLIN | EPOLLRDNORM;
 	if (tu->disconnected)
-		mask |= POLLERR;
+		mask |= EPOLLERR;
 	spin_unlock_irq(&tu->qlock);
 
 	return mask;

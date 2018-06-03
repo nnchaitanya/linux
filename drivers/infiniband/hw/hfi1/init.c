@@ -88,9 +88,9 @@
  * pio buffers per ctxt, etc.)  Zero means use one user context per CPU.
  */
 int num_user_contexts = -1;
-module_param_named(num_user_contexts, num_user_contexts, uint, S_IRUGO);
+module_param_named(num_user_contexts, num_user_contexts, int, 0444);
 MODULE_PARM_DESC(
-	num_user_contexts, "Set max number of user contexts to use");
+	num_user_contexts, "Set max number of user contexts to use (default: -1 will use the real (non-HT) CPU count)");
 
 uint krcvqs[RXE_NUM_DATA_VL];
 int krcvqsset;
@@ -172,7 +172,7 @@ int hfi1_create_kctxts(struct hfi1_devdata *dd)
 	u16 i;
 	int ret;
 
-	dd->rcd = kzalloc_node(dd->num_rcv_contexts * sizeof(*dd->rcd),
+	dd->rcd = kcalloc_node(dd->num_rcv_contexts, sizeof(*dd->rcd),
 			       GFP_KERNEL, dd->node);
 	if (!dd->rcd)
 		return -ENOMEM;
@@ -439,15 +439,16 @@ int hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, int numa,
 		 * The resulting value will be rounded down to the closest
 		 * multiple of dd->rcv_entries.group_size.
 		 */
-		rcd->egrbufs.buffers = kzalloc_node(
-			rcd->egrbufs.count * sizeof(*rcd->egrbufs.buffers),
-			GFP_KERNEL, numa);
+		rcd->egrbufs.buffers =
+			kcalloc_node(rcd->egrbufs.count,
+				     sizeof(*rcd->egrbufs.buffers),
+				     GFP_KERNEL, numa);
 		if (!rcd->egrbufs.buffers)
 			goto bail;
-		rcd->egrbufs.rcvtids = kzalloc_node(
-				rcd->egrbufs.count *
-				sizeof(*rcd->egrbufs.rcvtids),
-				GFP_KERNEL, numa);
+		rcd->egrbufs.rcvtids =
+			kcalloc_node(rcd->egrbufs.count,
+				     sizeof(*rcd->egrbufs.rcvtids),
+				     GFP_KERNEL, numa);
 		if (!rcd->egrbufs.rcvtids)
 			goto bail;
 		rcd->egrbufs.size = eager_buffer_size;
@@ -637,6 +638,15 @@ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
 	ppd->dd = dd;
 	ppd->hw_pidx = hw_pidx;
 	ppd->port = port; /* IB port number, not index */
+	ppd->prev_link_width = LINK_WIDTH_DEFAULT;
+	/*
+	 * There are C_VL_COUNT number of PortVLXmitWait counters.
+	 * Adding 1 to C_VL_COUNT to include the PortXmitWait counter.
+	 */
+	for (i = 0; i < C_VL_COUNT + 1; i++) {
+		ppd->port_vl_xmit_wait_last[i] = 0;
+		ppd->vl_xmit_flit_cnt[i] = 0;
+	}
 
 	default_pkey_idx = 1;
 
@@ -1058,8 +1068,9 @@ static void shutdown_device(struct hfi1_devdata *dd)
 	}
 	dd->flags &= ~HFI1_INITTED;
 
-	/* mask interrupts, but not errors */
+	/* mask and clean up interrupts, but not errors */
 	set_intr_state(dd, 0);
+	hfi1_clean_up_interrupts(dd);
 
 	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
 		ppd = dd->pport + pidx;
@@ -1198,27 +1209,47 @@ static void finalize_asic_data(struct hfi1_devdata *dd,
 	kfree(ad);
 }
 
-static void __hfi1_free_devdata(struct kobject *kobj)
+/**
+ * hfi1_clean_devdata - cleans up per-unit data structure
+ * @dd: pointer to a valid devdata structure
+ *
+ * It cleans up all data structures set up by
+ * by hfi1_alloc_devdata().
+ */
+static void hfi1_clean_devdata(struct hfi1_devdata *dd)
 {
-	struct hfi1_devdata *dd =
-		container_of(kobj, struct hfi1_devdata, kobj);
 	struct hfi1_asic_data *ad;
 	unsigned long flags;
 
 	spin_lock_irqsave(&hfi1_devs_lock, flags);
-	idr_remove(&hfi1_unit_table, dd->unit);
-	list_del(&dd->list);
+	if (!list_empty(&dd->list)) {
+		idr_remove(&hfi1_unit_table, dd->unit);
+		list_del_init(&dd->list);
+	}
 	ad = release_asic_data(dd);
 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
-	if (ad)
-		finalize_asic_data(dd, ad);
+
+	finalize_asic_data(dd, ad);
 	free_platform_config(dd);
 	rcu_barrier(); /* wait for rcu callbacks to complete */
 	free_percpu(dd->int_counter);
 	free_percpu(dd->rcv_limit);
 	free_percpu(dd->send_schedule);
 	free_percpu(dd->tx_opstats);
+	dd->int_counter   = NULL;
+	dd->rcv_limit     = NULL;
+	dd->send_schedule = NULL;
+	dd->tx_opstats    = NULL;
+	sdma_clean(dd, dd->num_sdma);
 	rvt_dealloc_device(&dd->verbs_dev.rdi);
+}
+
+static void __hfi1_free_devdata(struct kobject *kobj)
+{
+	struct hfi1_devdata *dd =
+		container_of(kobj, struct hfi1_devdata, kobj);
+
+	hfi1_clean_devdata(dd);
 }
 
 static struct kobj_type hfi1_devdata_type = {
@@ -1253,6 +1284,8 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
 		return ERR_PTR(-ENOMEM);
 	dd->num_pports = nports;
 	dd->pport = (struct hfi1_pportdata *)(dd + 1);
+	dd->pcidev = pdev;
+	pci_set_drvdata(pdev, dd);
 
 	INIT_LIST_HEAD(&dd->list);
 	idr_preload(GFP_KERNEL);
@@ -1319,9 +1352,7 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
 	return dd;
 
 bail:
-	if (!list_empty(&dd->list))
-		list_del_init(&dd->list);
-	rvt_dealloc_device(&dd->verbs_dev.rdi);
+	hfi1_clean_devdata(dd);
 	return ERR_PTR(ret);
 }
 
@@ -1704,6 +1735,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		dd_dev_err(dd, "Failed to create /dev devices: %d\n", -j);
 
 	if (initfail || ret) {
+		hfi1_clean_up_interrupts(dd);
 		stop_timers(dd);
 		flush_workqueue(ib_wq);
 		for (pidx = 0; pidx < dd->num_pports; ++pidx) {

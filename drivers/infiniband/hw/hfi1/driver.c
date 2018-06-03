@@ -256,7 +256,12 @@ static void rcv_hdrerr(struct hfi1_ctxtdata *rcd, struct hfi1_pportdata *ppd,
 	u32 mlid_base;
 	struct hfi1_ibport *ibp = rcd_to_iport(rcd);
 	struct hfi1_devdata *dd = ppd->dd;
-	struct rvt_dev_info *rdi = &dd->verbs_dev.rdi;
+	struct hfi1_ibdev *verbs_dev = &dd->verbs_dev;
+	struct rvt_dev_info *rdi = &verbs_dev->rdi;
+
+	if ((packet->rhf & RHF_DC_ERR) &&
+	    hfi1_dbg_fault_suppress_err(verbs_dev))
+		return;
 
 	if (packet->rhf & (RHF_VCRC_ERR | RHF_ICRC_ERR))
 		return;
@@ -385,6 +390,7 @@ static void rcv_hdrerr(struct hfi1_ctxtdata *rcd, struct hfi1_pportdata *ppd,
 				svc_type = IB_CC_SVCTYPE_UC;
 				break;
 			default:
+				rcu_read_unlock();
 				goto drop;
 			}
 
@@ -427,31 +433,43 @@ void hfi1_process_ecn_slowpath(struct rvt_qp *qp, struct hfi1_packet *pkt,
 			       bool do_cnp)
 {
 	struct hfi1_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
 	struct ib_other_headers *ohdr = pkt->ohdr;
 	struct ib_grh *grh = pkt->grh;
 	u32 rqpn = 0, bth1;
-	u16 pkey, rlid, dlid = ib_get_dlid(pkt->hdr);
+	u16 pkey;
+	u32 rlid, slid, dlid = 0;
 	u8 hdr_type, sc, svc_type;
 	bool is_mcast = false;
 
+	/* can be called from prescan */
 	if (pkt->etype == RHF_RCV_TYPE_BYPASS) {
 		is_mcast = hfi1_is_16B_mcast(dlid);
 		pkey = hfi1_16B_get_pkey(pkt->hdr);
 		sc = hfi1_16B_get_sc(pkt->hdr);
+		dlid = hfi1_16B_get_dlid(pkt->hdr);
+		slid = hfi1_16B_get_slid(pkt->hdr);
 		hdr_type = HFI1_PKT_TYPE_16B;
 	} else {
 		is_mcast = (dlid > be16_to_cpu(IB_MULTICAST_LID_BASE)) &&
 			   (dlid != be16_to_cpu(IB_LID_PERMISSIVE));
 		pkey = ib_bth_get_pkey(ohdr);
 		sc = hfi1_9B_get_sc5(pkt->hdr, pkt->rhf);
+		dlid = ib_get_dlid(pkt->hdr);
+		slid = ib_get_slid(pkt->hdr);
 		hdr_type = HFI1_PKT_TYPE_9B;
 	}
 
 	switch (qp->ibqp.qp_type) {
+	case IB_QPT_UD:
+		dlid = ppd->lid;
+		rlid = slid;
+		rqpn = ib_get_sqpn(pkt->ohdr);
+		svc_type = IB_CC_SVCTYPE_UD;
+		break;
 	case IB_QPT_SMI:
 	case IB_QPT_GSI:
-	case IB_QPT_UD:
-		rlid = ib_get_slid(pkt->hdr);
+		rlid = slid;
 		rqpn = ib_get_sqpn(pkt->ohdr);
 		svc_type = IB_CC_SVCTYPE_UD;
 		break;
@@ -476,7 +494,6 @@ void hfi1_process_ecn_slowpath(struct rvt_qp *qp, struct hfi1_packet *pkt,
 					      dlid, rlid, sc, grh);
 
 	if (!is_mcast && (bth1 & IB_BECN_SMASK)) {
-		struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
 		u32 lqpn = bth1 & RVT_QPN_MASK;
 		u8 sl = ibp->sc_to_sl[sc];
 
@@ -634,9 +651,10 @@ next:
 	}
 }
 
-static void process_rcv_qp_work(struct hfi1_ctxtdata *rcd)
+static void process_rcv_qp_work(struct hfi1_packet *packet)
 {
 	struct rvt_qp *qp, *nqp;
+	struct hfi1_ctxtdata *rcd = packet->rcd;
 
 	/*
 	 * Iterate over all QPs waiting to respond.
@@ -646,7 +664,8 @@ static void process_rcv_qp_work(struct hfi1_ctxtdata *rcd)
 		list_del_init(&qp->rspwait);
 		if (qp->r_flags & RVT_R_RSP_NAK) {
 			qp->r_flags &= ~RVT_R_RSP_NAK;
-			hfi1_send_rc_ack(rcd, qp, 0);
+			packet->qp = qp;
+			hfi1_send_rc_ack(packet, 0);
 		}
 		if (qp->r_flags & RVT_R_RSP_SEND) {
 			unsigned long flags;
@@ -667,7 +686,7 @@ static noinline int max_packet_exceeded(struct hfi1_packet *packet, int thread)
 	if (thread) {
 		if ((packet->numpkt & (MAX_PKT_RECV_THREAD - 1)) == 0)
 			/* allow defered processing */
-			process_rcv_qp_work(packet->rcd);
+			process_rcv_qp_work(packet);
 		cond_resched();
 		return RCV_PKT_OK;
 	} else {
@@ -809,7 +828,7 @@ int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *rcd, int thread)
 			last = RCV_PKT_DONE;
 		process_rcv_update(last, &packet);
 	}
-	process_rcv_qp_work(rcd);
+	process_rcv_qp_work(&packet);
 	rcd->head = packet.rhqoff;
 bail:
 	finish_packet(&packet);
@@ -838,7 +857,7 @@ int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *rcd, int thread)
 			last = RCV_PKT_DONE;
 		process_rcv_update(last, &packet);
 	}
-	process_rcv_qp_work(rcd);
+	process_rcv_qp_work(&packet);
 	rcd->head = packet.rhqoff;
 bail:
 	finish_packet(&packet);
@@ -1068,7 +1087,7 @@ int handle_receive_interrupt(struct hfi1_ctxtdata *rcd, int thread)
 		process_rcv_update(last, &packet);
 	}
 
-	process_rcv_qp_work(rcd);
+	process_rcv_qp_work(&packet);
 	rcd->head = packet.rhqoff;
 
 bail:
@@ -1438,8 +1457,8 @@ static int hfi1_setup_9B_packet(struct hfi1_packet *packet)
 	packet->sc = hfi1_9B_get_sc5(hdr, packet->rhf);
 	packet->pad = ib_bth_get_pad(packet->ohdr);
 	packet->extra_byte = 0;
-	packet->fecn = ib_bth_get_fecn(packet->ohdr);
-	packet->becn = ib_bth_get_becn(packet->ohdr);
+	packet->pkey = ib_bth_get_pkey(packet->ohdr);
+	packet->migrated = ib_bth_is_migration(packet->ohdr);
 
 	return 0;
 drop:
@@ -1492,8 +1511,10 @@ static int hfi1_setup_bypass_packet(struct hfi1_packet *packet)
 
 	/* Query commonly used fields from packet header */
 	packet->opcode = ib_bth_get_opcode(packet->ohdr);
-	packet->hlen = hdr_len_by_opcode[packet->opcode] + 8 + grh_len;
-	packet->payload = packet->ebuf + packet->hlen - (4 * sizeof(u32));
+	/* hdr_len_by_opcode already has an IB LRH factored in */
+	packet->hlen = hdr_len_by_opcode[packet->opcode] +
+		(LRH_16B_BYTES - LRH_9B_BYTES) + grh_len;
+	packet->payload = packet->ebuf + packet->hlen - LRH_16B_BYTES;
 	packet->slid = hfi1_16B_get_slid(packet->hdr);
 	packet->dlid = hfi1_16B_get_dlid(packet->hdr);
 	if (unlikely(hfi1_is_16B_mcast(packet->dlid)))
@@ -1504,8 +1525,8 @@ static int hfi1_setup_bypass_packet(struct hfi1_packet *packet)
 	packet->sl = ibp->sc_to_sl[packet->sc];
 	packet->pad = hfi1_16B_bth_get_pad(packet->ohdr);
 	packet->extra_byte = SIZE_OF_LT;
-	packet->fecn = hfi1_16B_get_fecn(packet->hdr);
-	packet->becn = hfi1_16B_get_becn(packet->hdr);
+	packet->pkey = hfi1_16B_get_pkey(packet->hdr);
+	packet->migrated = opa_bth_is_migration(packet->ohdr);
 
 	if (hfi1_bypass_ingress_pkt_check(packet))
 		goto drop;
@@ -1550,19 +1571,7 @@ int process_receive_ib(struct hfi1_packet *packet)
 	if (hfi1_setup_9B_packet(packet))
 		return RHF_RCV_CONTINUE;
 
-	trace_hfi1_rcvhdr(packet->rcd->ppd->dd,
-			  packet->rcd->ctxt,
-			  rhf_err_flags(packet->rhf),
-			  RHF_RCV_TYPE_IB,
-			  packet->hlen,
-			  packet->tlen,
-			  packet->updegr,
-			  rhf_egr_index(packet->rhf));
-
-	if (unlikely(
-		 (hfi1_dbg_fault_suppress_err(&packet->rcd->dd->verbs_dev) &&
-		 (packet->rhf & RHF_DC_ERR))))
-		return RHF_RCV_CONTINUE;
+	trace_hfi1_rcvhdr(packet);
 
 	if (unlikely(rhf_err_flags(packet->rhf))) {
 		handle_eflags(packet);
@@ -1597,6 +1606,8 @@ int process_receive_bypass(struct hfi1_packet *packet)
 
 	if (hfi1_setup_bypass_packet(packet))
 		return RHF_RCV_CONTINUE;
+
+	trace_hfi1_rcvhdr(packet);
 
 	if (unlikely(rhf_err_flags(packet->rhf))) {
 		handle_eflags(packet);

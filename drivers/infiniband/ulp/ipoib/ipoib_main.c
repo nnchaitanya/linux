@@ -1094,7 +1094,7 @@ drop_and_unlock:
 	spin_unlock_irqrestore(&priv->lock, flags);
 }
 
-static int ipoib_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t ipoib_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
 	struct rdma_netdev *rn = netdev_priv(dev);
@@ -2305,6 +2305,9 @@ static struct net_device *ipoib_add_port(const char *format,
 	INIT_IB_EVENT_HANDLER(&priv->event_handler,
 			      priv->ca, ipoib_event);
 	ib_register_event_handler(&priv->event_handler);
+
+	/* call event handler to ensure pkey in sync */
+	queue_work(ipoib_workqueue, &priv->flush_heavy);
 
 	result = register_netdev(priv->dev);
 	if (result) {
